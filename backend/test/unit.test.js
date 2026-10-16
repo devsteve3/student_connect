@@ -330,7 +330,7 @@ test('register: a firm account persists the contact person and industry', async 
     contactPerson: 'Grace Wanjiru',
     industrySector: 'Banking & financial services',
     email: 'Grace@Lumen-Analytics.co.ke',
-    password: 'password123',
+    password: 'Passw0rd!',
     role: 'firm'
   });
   assert.equal(res.statusCode, 201);
@@ -356,7 +356,7 @@ test('register: a university account persists the staff id and department', asyn
     staffId: 'ST-7781',
     department: 'School of Engineering',
     email: 'a.otieno@tuk.ac.ke',
-    password: 'password123',
+    password: 'Passw0rd!',
     role: 'university'
   });
   assert.equal(res.statusCode, 201);
@@ -375,12 +375,15 @@ test('register: a university account persists the staff id and department', asyn
 
 test('register: a student account persists the reg number and course', async () => {
   await ensureDb();
+  const uniRow = (await query('SELECT id FROM universities LIMIT 1')).rows[0];
+  assert.ok(uniRow, 'seed university exists');
   const res = await register({
     name: 'Brian Mutua',
     regNumber: 'BBIT/9001/2026',
     course: 'BSc. in Computer Science',
+    universityId: uniRow.id,
     email: 'brian.mutua@students.strathmore.edu',
-    password: 'password123',
+    password: 'Passw0rd!',
     role: 'student'
   });
   assert.equal(res.statusCode, 201);
@@ -402,7 +405,7 @@ test('register: rejects an admin self-signup', async () => {
   const res = await register({
     name: 'Rogue Admin',
     email: 'rogue@example.com',
-    password: 'password123',
+    password: 'Passw0rd!',
     role: 'admin'
   });
   assert.equal(res.statusCode, 400);
@@ -415,7 +418,7 @@ test('register: rejects a firm that omits its contact person', async () => {
     companyName: 'Half Formed Ltd',
     industrySector: 'Technology & software',
     email: 'nobody@halfformed.co.ke',
-    password: 'password123',
+    password: 'Passw0rd!',
     role: 'firm'
   });
   assert.equal(res.statusCode, 400);
@@ -428,11 +431,14 @@ test('register: rejects a firm that omits its contact person', async () => {
 
 test('register: rejects a duplicate email regardless of casing', async () => {
   await ensureDb();
+  const uniRow = (await query('SELECT id FROM universities LIMIT 1')).rows[0];
+  assert.ok(uniRow, 'seed university exists');
   const res = await register({
     name: 'Alex Kamau',
     regNumber: 'BBIT/1111/2020',
+    universityId: uniRow.id,
     email: 'ALEX.KAMAU@students.strathmore.edu',
-    password: 'password123',
+    password: 'Passw0rd!',
     role: 'student'
   });
   assert.equal(res.statusCode, 400);
@@ -446,15 +452,101 @@ test('login: works immediately after registering, and finds the email case-insen
     contactPerson: 'Peter Muriuki',
     industrySector: 'Technology & software',
     email: 'peter@tidewater.co.ke',
-    password: 'password123',
+    password: 'Passw0rd!',
     role: 'firm'
   });
 
   const res = mockRes();
-  await loginUser({ body: { email: 'PETER@Tidewater.co.ke', password: 'password123' } }, res, () => {});
+  await loginUser({ body: { email: 'PETER@Tidewater.co.ke', password: 'Passw0rd!' } }, res, () => {});
   assert.equal(res.statusCode, 200);
   assert.equal(res.body.role, 'firm');
   assert.ok(res.body.token);
 
   await query('DELETE FROM firms WHERE contact_email = $1', ['peter@tidewater.co.ke']);
+});
+
+// --- auth: per-account lockout ----------------------------------------------
+
+test('login: failed attempt increments login_attempts', async () => {
+  await ensureDb();
+  await register({
+    companyName: 'Lockout Test Ltd',
+    contactPerson: 'Test User',
+    industrySector: 'Technology & software',
+    email: 'lockout@test.co.ke',
+    password: 'Passw0rd!',
+    role: 'firm'
+  });
+
+  // 5 failed attempts
+  for (let i = 0; i < 5; i++) {
+    const res = mockRes();
+    await loginUser({ body: { email: 'lockout@test.co.ke', password: 'WrongPass1!' } }, res, () => {});
+    assert.equal(res.statusCode, 401, `attempt ${i + 1} should be rejected`);
+  }
+
+  const row = (await query('SELECT login_attempts FROM firms WHERE contact_email = $1', ['lockout@test.co.ke'])).rows[0];
+  assert.equal(row.login_attempts, 5, 'login_attempts should be 5 after 5 failures');
+
+  await query('DELETE FROM firms WHERE contact_email = $1', ['lockout@test.co.ke']);
+});
+
+test('login: account is locked after 5 failed attempts', async () => {
+  await ensureDb();
+  await register({
+    companyName: 'Locked Out Ltd',
+    contactPerson: 'Locked User',
+    industrySector: 'Technology & software',
+    email: 'locked@test.co.ke',
+    password: 'Passw0rd!',
+    role: 'firm'
+  });
+
+  // Exhaust the lockout threshold
+  for (let i = 0; i < 5; i++) {
+    const res = mockRes();
+    await loginUser({ body: { email: 'locked@test.co.ke', password: 'WrongPass1!' } }, res, () => {});
+    assert.equal(res.statusCode, 401);
+  }
+
+  // The 6th attempt (even with the correct password) must still be rejected
+  const res = mockRes();
+  await loginUser({ body: { email: 'locked@test.co.ke', password: 'Passw0rd!' } }, res, () => {});
+  assert.equal(res.statusCode, 401, 'locked account should be rejected even with correct password');
+
+  const row = (await query('SELECT locked_until FROM firms WHERE contact_email = $1', ['locked@test.co.ke'])).rows[0];
+  assert.ok(row.locked_until, 'locked_until should be set');
+
+  await query('DELETE FROM firms WHERE contact_email = $1', ['locked@test.co.ke']);
+});
+
+test('login: successful login resets attempts and clears lockout', async () => {
+  await ensureDb();
+  await register({
+    companyName: 'Reset Test Ltd',
+    contactPerson: 'Reset User',
+    industrySector: 'Technology & software',
+    email: 'reset@test.co.ke',
+    password: 'Passw0rd!',
+    role: 'firm'
+  });
+
+  // A few failed attempts
+  for (let i = 0; i < 3; i++) {
+    const res = mockRes();
+    await loginUser({ body: { email: 'reset@test.co.ke', password: 'WrongPass1!' } }, res, () => {});
+    assert.equal(res.statusCode, 401);
+  }
+
+  // Now the correct password
+  const success = mockRes();
+  await loginUser({ body: { email: 'reset@test.co.ke', password: 'Passw0rd!' } }, success, () => {});
+  assert.equal(success.statusCode, 200);
+
+  const row = (await query('SELECT login_attempts, locked_until, last_login_at FROM firms WHERE contact_email = $1', ['reset@test.co.ke'])).rows[0];
+  assert.equal(row.login_attempts, 0, 'login_attempts should be reset to 0');
+  assert.equal(row.locked_until, null, 'locked_until should be cleared');
+  assert.ok(row.last_login_at, 'last_login_at should be set');
+
+  await query('DELETE FROM firms WHERE contact_email = $1', ['reset@test.co.ke']);
 });
